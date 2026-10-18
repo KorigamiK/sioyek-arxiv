@@ -1,0 +1,31 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-15]
+        python: ['3.14', '3.15']
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m unittest discover -s tests -v
+      - name: Exercise the native macOS app lifecycle
+        if: runner.os == 'macOS'
+        env:
+          TEST_HOME: ${{ runner.temp }}/sioyek-arxiv-home
+        run: |
+          mkdir -p "$TEST_HOME/Applications/sioyek.app"
+          HOME="$TEST_HOME" python sioyek_arxiv.py setup --no-open --sioyek-app "$TEST_HOME/Applications/sioyek.app"
+          codesign --verify "$TEST_HOME/Applications/Sioyek arXiv.app"
+          HOME="$TEST_HOME" python sioyek_arxiv.py uninstall
