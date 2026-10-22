@@ -1,10 +1,12 @@
-# arXiv → Sioyek
+# Open in Sioyek
 
-One bookmarklet click saves an arXiv paper with its title and version, then opens
-the local PDF in [Sioyek](https://sioyek.info).
+One bookmarklet opens arXiv papers, direct web PDF URLs, and local `file://` PDFs
+in [Sioyek](https://sioyek.info). Web PDFs are saved in your papers folder;
+local PDFs open in place.
 
 ```text
-arXiv abstract page → Open in Sioyek → ~/Downloads/Papers → Sioyek
+arXiv or web PDF → Open in Sioyek → ~/Downloads/Papers → Sioyek
+local file:// PDF → Open in Sioyek → existing file in Sioyek
 ```
 
 For example:
@@ -28,14 +30,17 @@ brew install --cask sioyek
 Then install the helper and set up your account:
 
 ```sh
-brew install korigamik/tap/sioyek-arxiv
-sioyek-arxiv setup --browser Firefox
+brew install korigamik/tap/sioyek-open
+sioyek-open setup --browser Firefox
 ```
 
 The setup page opens in Firefox. Drag **Open in Sioyek** onto the bookmarks
-toolbar. On an arXiv abstract or HTML paper page, click the bookmark and allow
-Firefox to launch **Sioyek arXiv**. The browser may offer to remember that choice.
-Use the paper's `/abs/` page if the bookmarklet does not run in the PDF viewer.
+toolbar. On an arXiv paper page or a PDF URL, click the bookmark and allow
+Firefox to launch **Open in Sioyek**. The browser may offer to remember that choice.
+If Firefox blocks the bookmarklet in its PDF viewer, copy the PDF's address,
+switch to an ordinary web page, click the bookmark, and paste the URL into the
+prompt. This also accepts local `file://` URLs and PDF download URLs without
+a `.pdf` extension.
 
 `setup` detects Sioyek in `/Applications` or `~/Applications`, keeps an existing
 configuration, and defaults to saving papers in `~/Downloads/Papers`. It creates
@@ -44,12 +49,12 @@ a small per-user URL handler app; it does not change Sioyek itself.
 ## Customize
 
 ```sh
-sioyek-arxiv setup --papers-dir ~/Documents/Papers
-sioyek-arxiv setup --sioyek-app ~/Applications/sioyek.app
-sioyek-arxiv setup --no-open
-sioyek-arxiv status
-sioyek-arxiv bookmarklet --browser Firefox
-sioyek-arxiv bookmarklet --print
+sioyek-open setup --papers-dir ~/Documents/Papers
+sioyek-open setup --sioyek-app ~/Applications/sioyek.app
+sioyek-open setup --no-open
+sioyek-open status
+sioyek-open bookmarklet --browser Firefox
+sioyek-open bookmarklet --print
 ```
 
 You can also edit `~/.config/sioyek/arxiv.json`:
@@ -67,36 +72,60 @@ new folder. The download command reads settings on each invocation.
 ## Use from a terminal
 
 ```sh
-sioyek-arxiv open https://arxiv.org/abs/1706.03762
-sioyek-arxiv open --no-open https://arxiv.org/abs/1706.03762
+sioyek-open open https://arxiv.org/abs/1706.03762
+sioyek-open open --no-open https://arxiv.org/abs/1706.03762
+sioyek-open open 'https://example.org/reports/paper.pdf'
+sioyek-open open 'file:///Users/you/Documents/My%20Paper.pdf'
 ```
 
 Abstract, HTML, and PDF URLs are accepted, including old-style arXiv IDs. An
 unversioned URL resolves the latest version listed on the abstract page. An
 explicit version URL keeps that version. Existing copies are reused, incomplete
-downloads stay temporary, and non-PDF responses are rejected. Only arXiv paper
-URLs are supported; arbitrary publisher pages and login-gated PDFs are outside
-this helper's scope.
+downloads stay temporary, and non-PDF responses are rejected.
+
+Other HTTP(S) URLs must return a PDF. Their filenames use the URL's basename
+and a short identifier, such as `paper [a4b9e6c281de].pdf`, so different URLs
+with the same filename do not overwrite each other. Query parameters are
+included in the identifier; page fragments such as `#page=3` are not. Repeated
+opens reuse the saved file; remove it to download a fresh copy from a changing
+URL. Redirects and extensionless PDF download endpoints are supported.
+
+Local `file://` PDFs are validated and opened at their existing location,
+without copying them into the papers folder. URL-encoded spaces and Unicode
+filenames are supported. Only local file URLs (empty host or `localhost`) are
+accepted.
+
+The downloader does not share Firefox's login session. For a PDF requiring
+browser cookies or sign-in, download it in Firefox first, then use its local
+`file://` URL.
 
 ## Updates and existing installations
 
 ```sh
 brew update
-brew upgrade sioyek-arxiv
+brew upgrade sioyek-open
 ```
 
 The registered app launches the package through Homebrew's stable `opt` path,
 so formula upgrades do not embed obsolete Cellar or Python patch-version paths.
-Rerun `sioyek-arxiv setup` to refresh the app and setup page when needed.
+Rerun `sioyek-open setup` to refresh the app and setup page when needed.
+
+**Upgrading from 0.1.0:** Homebrew migrates the old `sioyek-arxiv` formula to
+`sioyek-open`. Run `sioyek-open setup --browser Firefox`, then replace
+the old browser bookmark with the new button from the setup page. The old
+bookmark's JavaScript restricts it to arXiv; upgrading the program alone does
+not replace browser bookmarks.
 
 If you used the original helper in
 [KorigamiK/sioyek](https://github.com/KorigamiK/sioyek), install this formula and
-run `setup`. It uses the same `sioyek-arxiv://` scheme, settings file, and per-user
-app location. Your existing bookmark and downloaded papers continue to work.
+run `setup`. The original `sioyek-arxiv` command and `sioyek-arxiv://` URL scheme remain
+compatibility aliases. Existing settings and papers are preserved. Setup
+replaces the old app with `~/Applications/Open in Sioyek.app`. The settings and
+support files keep their original paths for compatibility.
 
 ## Files and removal
 
-- App: `~/Applications/Sioyek arXiv.app`
+- App: `~/Applications/Open in Sioyek.app`
 - Settings: `~/.config/sioyek/arxiv.json`
 - Setup page: `~/Library/Application Support/Sioyek arXiv/bookmarklet.html`
 - Errors and download log: `~/Library/Application Support/Sioyek arXiv/download.log`
@@ -104,8 +133,8 @@ app location. Your existing bookmark and downloaded papers continue to work.
 To remove the per-user integration and package:
 
 ```sh
-sioyek-arxiv uninstall
-brew uninstall sioyek-arxiv
+sioyek-open uninstall
+brew uninstall sioyek-open
 ```
 
 Remove the bookmark from your browser manually. Saved PDFs and settings are kept.

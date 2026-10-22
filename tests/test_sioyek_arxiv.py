@@ -37,6 +37,7 @@ class WorkflowTests(unittest.TestCase):
             ("https://arxiv.org/html/1706.03762v7", "1706.03762v7"),
             ("https://arxiv.org/pdf/hep-th/9901001v2.pdf#page=3", "hep-th/9901001v2"),
             ("sioyek-arxiv://open?url=https%3A%2F%2Farxiv.org%2Fabs%2F1706.03762", "1706.03762"),
+            ("sioyek-open://open?url=https%3A%2F%2Farxiv.org%2Fabs%2F1706.03762", "1706.03762"),
         ]:
             with self.subTest(url=url):
                 self.assertEqual(app.paper_id(url), identifier)
@@ -117,9 +118,9 @@ class WorkflowTests(unittest.TestCase):
         config = {"papers_dir": str(papers), "sioyek_app": str(sioyek), "future_option": True}
         app.config_path().parent.mkdir(parents=True)
         app.config_path().write_text(json.dumps(config))
-        launcher = "/opt/homebrew/opt/sioyek-arxiv/bin/sioyek-arxiv"
+        launcher = "/opt/homebrew/opt/sioyek-open/bin/sioyek-open"
         with patch.object(app.sys, "platform", "darwin"), \
-                patch.dict(os.environ, {"SIOYEK_ARXIV_LAUNCHER": launcher}), \
+                patch.dict(os.environ, {"SIOYEK_OPEN_LAUNCHER": launcher}), \
                 patch.object(app.subprocess, "run", side_effect=self.fake_native_command):
             app.setup(self.setup_args())
             app.setup(self.setup_args())
@@ -129,7 +130,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("open --notify", script)
         self.assertNotIn("Cellar", script)
         info = plistlib.loads((app.handler_app() / "Contents/Info.plist").read_bytes())
-        self.assertEqual(info["CFBundleURLTypes"][0]["CFBundleURLSchemes"], ["sioyek-arxiv"])
+        self.assertEqual(info["CFBundleURLTypes"][0]["CFBundleURLSchemes"], ["sioyek-open", "sioyek-arxiv"])
         self.assertNotIn("NSCameraUsageDescription", info)
         self.assertIn(str(papers), (app.support_dir() / "bookmarklet.html").read_text())
         self.assertEqual((app.support_dir() / "bookmarklet.txt").read_text().strip(), app.BOOKMARKLET)

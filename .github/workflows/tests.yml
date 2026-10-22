@@ -27,5 +27,5 @@ jobs:
         run: |
           mkdir -p "$TEST_HOME/Applications/sioyek.app"
           HOME="$TEST_HOME" python sioyek_arxiv.py setup --no-open --sioyek-app "$TEST_HOME/Applications/sioyek.app"
-          codesign --verify "$TEST_HOME/Applications/Sioyek arXiv.app"
+          codesign --verify "$TEST_HOME/Applications/Open in Sioyek.app"
           HOME="$TEST_HOME" python sioyek_arxiv.py uninstall

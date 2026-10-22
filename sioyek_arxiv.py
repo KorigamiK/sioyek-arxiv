@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Save an arXiv paper under its title and open the local PDF in Sioyek."""
+"""Open arXiv papers, web PDFs, and local file:// PDFs in Sioyek."""
 
 import argparse
 import fcntl
+import hashlib
 import html
 import json
 import os
@@ -19,11 +20,17 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 
-VERSION = "0.1.0"
+VERSION = "0.2.0"
 BOOKMARKLET = (
-    "javascript:(()=>{if(!/^(www\\.|export\\.)?arxiv\\.org$/.test(location.hostname))"
-    "{alert('Open an arXiv paper page first.');return;}"
-    "location.href='sioyek-arxiv://open?url='+encodeURIComponent(location.href);})()"
+    "javascript:(()=>{let u=new URL(location.href);"
+    "const arxiv=/^(www\\.|export\\.)?arxiv\\.org$/.test(u.hostname)"
+    "&&/^\\/(abs|html|pdf)\\//.test(u.pathname);"
+    "const pdf=/\\.pdf$/i.test(u.pathname)||document.contentType==='application/pdf';"
+    "if(!arxiv&&!pdf){const s=prompt('Paste an arXiv, PDF, or local file:// PDF URL:','');"
+    "if(!s)return;try{u=new URL(s.trim());}catch{alert('Please enter a complete URL.');return;}}"
+    "if(!['https:','http:','file:'].includes(u.protocol))"
+    "{alert('Use an http://, https://, or local file:// URL.');return;}"
+    "location.href='sioyek-open://open?url='+encodeURIComponent(u.href);})()"
 )
 ARXIV_ID = r"(?:\d{4}\.\d{4,5}|[a-zA-Z][a-zA-Z.-]*/\d{7})(?:v[1-9]\d*)?"
 
@@ -37,7 +44,19 @@ def support_dir():
 
 
 def handler_app():
+    return Path.home() / "Applications/Open in Sioyek.app"
+
+
+def legacy_handler_app():
     return Path.home() / "Applications/Sioyek arXiv.app"
+
+
+def owns_handler(path):
+    try:
+        info = plistlib.loads((path / "Contents/Info.plist").read_bytes())
+        return info.get("CFBundleIdentifier") == "local.sioyek.arxiv"
+    except (OSError, ValueError, plistlib.InvalidFileException):
+        return False
 
 
 def load_config():
@@ -64,16 +83,41 @@ def find_sioyek(config, override=None):
     for app in candidates:
         if app.is_dir():
             return app.absolute()
-    raise ValueError("Install Sioyek first, or run sioyek-arxiv setup --sioyek-app /path/to/sioyek.app")
+    raise ValueError("Install Sioyek first, or run sioyek-open setup --sioyek-app /path/to/sioyek.app")
+
+
+def unwrap_url(value):
+    url = urlsplit(value)
+    if url.scheme in ("sioyek-open", "sioyek-arxiv"):
+        if url.netloc != "open" or url.path not in ("", "/"):
+            raise ValueError("Expected sioyek-open://open?url=...")
+        values = parse_qs(url.query).get("url", [])
+        if len(values) != 1 or not values[0]:
+            raise ValueError("Expected one URL in sioyek-open://open?url=...")
+        return values[0]
+    return value
+
+
+def document_url(value):
+    value = unwrap_url(value)
+    url = urlsplit(value)
+    if url.scheme == "file":
+        if url.netloc.lower() not in ("", "localhost") or not url.path.startswith("/"):
+            raise ValueError("Use a local file:// PDF URL, without a remote hostname.")
+        path = unquote(url.path)
+        if "\x00" in path:
+            raise ValueError("The local file URL contains an invalid path.")
+        return value
+    if (url.scheme not in ("https", "http") or not url.hostname
+            or url.username is not None or url.password is not None
+            or url.port == 0):
+        raise ValueError("Use an arXiv URL, an http(s) PDF URL, or a local file:// PDF URL.")
+    # Fragments such as #page=3 do not identify a different downloadable file.
+    return url._replace(fragment="").geturl()
 
 
 def paper_id(value):
-    url = urlsplit(value)
-    if url.scheme == "sioyek-arxiv":
-        if url.netloc != "open":
-            raise ValueError("Expected sioyek-arxiv://open?url=...")
-        value = parse_qs(url.query).get("url", [""])[0]
-        url = urlsplit(value)
+    url = urlsplit(unwrap_url(value))
     if (url.scheme not in ("https", "http")
             or url.hostname not in ("arxiv.org", "www.arxiv.org", "export.arxiv.org")
             or url.username or url.password or url.port not in (None, 80, 443)):
@@ -102,7 +146,7 @@ class Metadata(HTMLParser):
 def fetch(url, destination):
     subprocess.run([
         "/usr/bin/curl", "--fail", "--location", "--silent", "--show-error",
-        "--proto", "=https", "--proto-redir", "=https", "--connect-timeout", "15",
+        "--proto", "=http,https", "--proto-redir", "=http,https", "--connect-timeout", "15",
         "--max-time", "180", "--retry", "2", "--retry-delay", "2",
         "--output", str(destination), url,
     ], check=True)
@@ -147,8 +191,12 @@ def is_pdf(path):
 def save_paper(url, directory):
     identifier = paper_id(url)
     title, identifier = describe(identifier)
+    return download_pdf("https://arxiv.org/pdf/" + identifier, directory, filename(title, identifier))
+
+
+def download_pdf(url, directory, name):
     directory.mkdir(parents=True, exist_ok=True)
-    destination = directory / filename(title, identifier)
+    destination = directory / name
     # Serialize repeated clicks, and never expose a partially downloaded PDF.
     with (directory / ".sioyek-arxiv.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
@@ -160,9 +208,9 @@ def save_paper(url, directory):
                                          delete=False) as stream:
             partial = Path(stream.name)
         try:
-            fetch("https://arxiv.org/pdf/" + identifier, partial)
+            fetch(url, partial)
             if not is_pdf(partial):
-                raise ValueError("arXiv returned something other than a PDF; nothing was saved.")
+                raise ValueError("The URL returned something other than a PDF; nothing was saved.")
             # link() refuses to overwrite an existing file, even in a race.
             os.link(partial, destination)
         finally:
@@ -170,11 +218,31 @@ def save_paper(url, directory):
     return destination
 
 
+def open_document(value, directory):
+    value = document_url(value)
+    url = urlsplit(value)
+    if url.scheme == "file":
+        path = Path(unquote(url.path))
+        if not path.is_file():
+            raise ValueError(f"Local PDF not found: {path}")
+        if not is_pdf(path):
+            raise ValueError(f"The local file is not a PDF: {path}")
+        return path
+    if url.hostname in ("arxiv.org", "www.arxiv.org", "export.arxiv.org"):
+        return save_paper(value, directory)
+    # Keep the URL's readable filename and distinguish documents with the same
+    # basename. Include the query in the identity, but never expose it in names.
+    title = unquote(url.path.rsplit("/", 1)[-1])
+    title = re.sub(r"\.pdf$", "", title, flags=re.IGNORECASE) or "Document"
+    identifier = hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
+    return download_pdf(value, directory, filename(title, identifier))
+
+
 def notify_error(message):
     # Pass the message as argv rather than interpolating it into AppleScript.
     subprocess.run([
         "/usr/bin/osascript", "-e",
-        'on run argv\ndisplay alert "Sioyek arXiv" message (item 1 of argv)\nend run',
+        'on run argv\ndisplay alert "Open in Sioyek" message (item 1 of argv)\nend run',
         message,
     ], check=False)
 
@@ -186,7 +254,7 @@ def applescript_string(value):
 def launcher_command():
     # The Homebrew wrapper supplies its stable opt path. Never bake a Cellar
     # version or Python patch version into the per-user application.
-    installed = os.environ.get("SIOYEK_ARXIV_LAUNCHER")
+    installed = os.environ.get("SIOYEK_OPEN_LAUNCHER") or os.environ.get("SIOYEK_ARXIV_LAUNCHER")
     if installed:
         return [installed]
     return [sys.executable, str(Path(__file__).absolute())]
@@ -196,35 +264,39 @@ def bookmarklet_page(directory):
     return (
         '<!doctype html><html lang="en"><meta charset="utf-8">'
         '<meta name="viewport" content="width=device-width,initial-scale=1">'
-        '<title>arXiv → Sioyek</title>'
+        '<title>Open in Sioyek</title>'
         '<style>body{font:18px system-ui;max-width:740px;margin:60px auto;line-height:1.6;'
         'padding:0 24px;color:#20242b;background:#f6f7fa}'
         'a.bookmark{display:inline-block;padding:12px 18px;background:#2456b8;'
         'color:white;border-radius:8px}textarea{box-sizing:border-box;width:100%;'
         'height:140px;padding:12px}code{overflow-wrap:anywhere}</style>'
-        '<h1>arXiv → Sioyek</h1>'
+        '<h1>Open in Sioyek</h1>'
         '<p>Drag this button onto your Firefox bookmarks toolbar:</p>'
         '<p><a class="bookmark" href="' + html.escape(BOOKMARKLET, quote=True)
         + '">Open in Sioyek</a></p>'
-        '<p>On an arXiv abstract or HTML paper page, click the bookmark. '
-        'Allow Firefox to open <b>Sioyek arXiv</b> when prompted. '
-        'The PDF is saved in <code>' + html.escape(str(directory)) + '</code> '
-        'with its title and version, then opened in Sioyek.</p>'
+        '<p>On an arXiv paper page, a direct PDF URL, or a local '
+        '<code>file://</code> PDF, click the bookmark. '
+        'Allow Firefox to open <b>Open in Sioyek</b> when prompted. '
+        'Web PDFs are saved in <code>' + html.escape(str(directory)) + '</code>. '
+        'arXiv papers keep their title-and-version names; other PDFs use their '
+        'URL filename and a short identifier. Local PDFs open in place.</p>'
         '<p>If the toolbar is hidden, press <b>⌘⇧B</b>. '
         'Alternatively, create a bookmark and paste this into its URL field:</p>'
         '<textarea readonly aria-label="Bookmarklet URL">'
         + html.escape(BOOKMARKLET) + '</textarea>'
-        '<p>If the bookmark does not run in Firefox’s PDF viewer, use the paper’s '
-        '<code>/abs/</code> page.</p>'
+        '<p>If a browser blocks bookmarklets in its PDF viewer, copy the PDF URL, '
+        'go to an ordinary web page, click this bookmark, and paste the URL into '
+        'the prompt. This also works for local <code>file://</code> PDF URLs '
+        'and PDF download URLs that do not end in <code>.pdf</code>.</p>'
         '<p>Change the download folder with '
-        '<code>sioyek-arxiv setup --papers-dir /path/to/papers</code>.</p></html>'
+        '<code>sioyek-open setup --papers-dir /path/to/papers</code>.</p></html>'
     )
 
 
 def open_bookmarklet(browser=None):
     page = support_dir() / "bookmarklet.html"
     if not page.exists():
-        raise ValueError("Run sioyek-arxiv setup first.")
+        raise ValueError("Run sioyek-open setup first.")
     command = ["/usr/bin/open"]
     if browser:
         command.extend(["-a", browser])
@@ -239,6 +311,8 @@ def setup(args):
     sioyek = find_sioyek(config, args.sioyek_app)
     support = support_dir()
     app = handler_app()
+    if app.exists() and not owns_handler(app):
+        raise ValueError(f"Refusing to replace an unrelated application: {app}")
     app.parent.mkdir(parents=True, exist_ok=True)
     log = support / "download.log"
     command = shlex.join(launcher_command() + ["open", "--notify"])
@@ -263,18 +337,21 @@ def setup(args):
                 if not (key.startswith("NS") and key.endswith("UsageDescription"))}
         info.update(
             CFBundleIdentifier="local.sioyek.arxiv",
-            CFBundleName="Sioyek arXiv",
+            CFBundleName="Open in Sioyek",
             CFBundleShortVersionString=VERSION,
             LSUIElement=True,
-            CFBundleURLTypes=[dict(CFBundleURLName="Sioyek arXiv",
-                                  CFBundleURLSchemes=["sioyek-arxiv"],
+            CFBundleURLTypes=[dict(CFBundleURLName="Open in Sioyek",
+                                  CFBundleURLSchemes=["sioyek-open", "sioyek-arxiv"],
                                   CFBundleTypeRole="Viewer")],
         )
         plist.write_bytes(plistlib.dumps(info))
         subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-", str(built)], check=True)
         previous = staging / "previous.app"
-        if app.exists():
-            app.rename(previous)
+        previous_path = app
+        if not app.exists() and owns_handler(legacy_handler_app()):
+            previous_path = legacy_handler_app()
+        if previous_path.exists():
+            previous_path.rename(previous)
         try:
             built.rename(app)
             subprocess.run([
@@ -285,8 +362,11 @@ def setup(args):
             if app.exists():
                 shutil.rmtree(app)
             if previous.exists():
-                previous.rename(app)
+                previous.rename(previous_path)
             raise
+        # If both generations were installed, remove only our legacy app.
+        if owns_handler(legacy_handler_app()):
+            shutil.rmtree(legacy_handler_app())
     config.update(papers_dir=str(directory), sioyek_app=str(sioyek))
     config_path().parent.mkdir(parents=True, exist_ok=True)
     config_path().write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
@@ -302,16 +382,15 @@ def setup(args):
 
 
 def uninstall():
-    app = handler_app()
-    if app.exists():
-        info = plistlib.loads((app / "Contents/Info.plist").read_bytes())
-        if info.get("CFBundleIdentifier") != "local.sioyek.arxiv":
-            raise ValueError(f"Refusing to remove an unrelated application: {app}")
-        subprocess.run([
-            "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister",
-            "-u", str(app),
-        ], check=True)
-        shutil.rmtree(app)
+    for app in (handler_app(), legacy_handler_app()):
+        if app.exists():
+            if not owns_handler(app):
+                raise ValueError(f"Refusing to remove an unrelated application: {app}")
+            subprocess.run([
+                "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister",
+                "-u", str(app),
+            ], check=True)
+            shutil.rmtree(app)
     if support_dir().exists():
         shutil.rmtree(support_dir())
     print("Removed the per-user URL handler and bookmarklet setup files.")
@@ -319,16 +398,16 @@ def uninstall():
 
 
 def main():
-    parser = argparse.ArgumentParser(prog="sioyek-arxiv", description=__doc__)
-    parser.add_argument("--version", action="version", version=f"sioyek-arxiv {VERSION}")
+    parser = argparse.ArgumentParser(prog="sioyek-open", description=__doc__)
+    parser.add_argument("--version", action="version", version=f"sioyek-open {VERSION}")
     commands = parser.add_subparsers(dest="command", required=True)
     install = commands.add_parser("setup", help="Install or update your macOS URL handler")
     install.add_argument("--papers-dir", help="PDF folder (default: existing setting or ~/Downloads/Papers)")
     install.add_argument("--sioyek-app", help="Path to Sioyek.app (auto-detected by default)")
     install.add_argument("--no-open", action="store_true", help="Do not open the bookmarklet page")
     install.add_argument("--browser", help="Browser to use for the setup page, e.g. Firefox")
-    download = commands.add_parser("open", help="Save an arXiv PDF and open it in Sioyek")
-    download.add_argument("url", help="arXiv URL or sioyek-arxiv://open?url=...")
+    download = commands.add_parser("open", help="Open an arXiv paper, web PDF, or local PDF in Sioyek")
+    download.add_argument("url", help="arXiv URL, http(s) PDF URL, file:// PDF URL, or sioyek-open://open?url=...")
     download.add_argument("--no-open", action="store_true", help="Download without opening Sioyek")
     download.add_argument("--notify", action="store_true", help="Show errors in a macOS alert")
     bookmark = commands.add_parser("bookmarklet", help="Open the bookmarklet setup page")
@@ -349,15 +428,15 @@ def main():
             uninstall()
         elif args.command == "status":
             config = load_config()
-            print(f"Version: {VERSION}\nURL handler installed: {handler_app().is_dir()}")
+            print(f"Version: {VERSION}\nURL handler installed: {handler_app().is_dir() or owns_handler(legacy_handler_app())}")
             print(f"Papers: {config.get('papers_dir', '~/Downloads/Papers')}")
             print(f"Sioyek: {config.get('sioyek_app', 'auto-detect')}\nConfig: {config_path()}")
         elif args.command == "open":
-            paper_id(args.url)
+            document_url(args.url)
             config = load_config()
             directory = Path(config.get("papers_dir", "~/Downloads/Papers")).expanduser()
             app = find_sioyek(config) if not args.no_open else None
-            destination = save_paper(args.url, directory)
+            destination = open_document(args.url, directory)
             print(destination, flush=True)
             if app:
                 subprocess.run(["/usr/bin/open", "-a", str(app), str(destination)], check=True)
