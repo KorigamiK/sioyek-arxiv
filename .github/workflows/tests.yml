@@ -23,9 +23,9 @@ jobs:
       - name: Exercise the native macOS app lifecycle
         if: runner.os == 'macOS'
         env:
-          TEST_HOME: ${{ runner.temp }}/sioyek-arxiv-home
+          TEST_HOME: ${{ runner.temp }}/sioyek-open-home
         run: |
           mkdir -p "$TEST_HOME/Applications/sioyek.app"
-          HOME="$TEST_HOME" python sioyek_arxiv.py setup --no-open --sioyek-app "$TEST_HOME/Applications/sioyek.app"
+          HOME="$TEST_HOME" python sioyek_open.py setup --no-open --sioyek-app "$TEST_HOME/Applications/sioyek.app"
           codesign --verify "$TEST_HOME/Applications/Open in Sioyek.app"
-          HOME="$TEST_HOME" python sioyek_arxiv.py uninstall
+          HOME="$TEST_HOME" python sioyek_open.py uninstall

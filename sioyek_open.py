@@ -20,7 +20,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 
-VERSION = "0.2.0"
+VERSION = "0.3.0"
 BOOKMARKLET = (
     "javascript:(()=>{let u=new URL(location.href);"
     "const arxiv=/^(www\\.|export\\.)?arxiv\\.org$/.test(u.hostname)"
@@ -36,25 +36,21 @@ ARXIV_ID = r"(?:\d{4}\.\d{4,5}|[a-zA-Z][a-zA-Z.-]*/\d{7})(?:v[1-9]\d*)?"
 
 
 def config_path():
-    return Path.home() / ".config/sioyek/arxiv.json"
+    return Path.home() / ".config/sioyek-open/config.json"
 
 
 def support_dir():
-    return Path.home() / "Library/Application Support/Sioyek arXiv"
+    return Path.home() / "Library/Application Support/Open in Sioyek"
 
 
 def handler_app():
     return Path.home() / "Applications/Open in Sioyek.app"
 
 
-def legacy_handler_app():
-    return Path.home() / "Applications/Sioyek arXiv.app"
-
-
 def owns_handler(path):
     try:
         info = plistlib.loads((path / "Contents/Info.plist").read_bytes())
-        return info.get("CFBundleIdentifier") == "local.sioyek.arxiv"
+        return info.get("CFBundleIdentifier") == "local.sioyek.open"
     except (OSError, ValueError, plistlib.InvalidFileException):
         return False
 
@@ -88,7 +84,7 @@ def find_sioyek(config, override=None):
 
 def unwrap_url(value):
     url = urlsplit(value)
-    if url.scheme in ("sioyek-open", "sioyek-arxiv"):
+    if url.scheme == "sioyek-open":
         if url.netloc != "open" or url.path not in ("", "/"):
             raise ValueError("Expected sioyek-open://open?url=...")
         values = parse_qs(url.query).get("url", [])
@@ -153,7 +149,7 @@ def fetch(url, destination):
 
 
 def describe(identifier):
-    with tempfile.TemporaryDirectory(prefix="sioyek-arxiv-") as temp:
+    with tempfile.TemporaryDirectory(prefix="sioyek-open-") as temp:
         page = Path(temp) / "abstract.html"
         fetch("https://arxiv.org/abs/" + identifier, page)
         metadata = Metadata()
@@ -198,13 +194,13 @@ def download_pdf(url, directory, name):
     directory.mkdir(parents=True, exist_ok=True)
     destination = directory / name
     # Serialize repeated clicks, and never expose a partially downloaded PDF.
-    with (directory / ".sioyek-arxiv.lock").open("a") as lock:
+    with (directory / ".sioyek-open.lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
         if destination.exists():
             if is_pdf(destination):
                 return destination
             raise ValueError(f"Existing file is not a PDF; move it aside first: {destination}")
-        with tempfile.NamedTemporaryFile(dir=directory, prefix=".arxiv-", suffix=".part",
+        with tempfile.NamedTemporaryFile(dir=directory, prefix=".sioyek-open-", suffix=".part",
                                          delete=False) as stream:
             partial = Path(stream.name)
         try:
@@ -254,7 +250,7 @@ def applescript_string(value):
 def launcher_command():
     # The Homebrew wrapper supplies its stable opt path. Never bake a Cellar
     # version or Python patch version into the per-user application.
-    installed = os.environ.get("SIOYEK_OPEN_LAUNCHER") or os.environ.get("SIOYEK_ARXIV_LAUNCHER")
+    installed = os.environ.get("SIOYEK_OPEN_LAUNCHER")
     if installed:
         return [installed]
     return [sys.executable, str(Path(__file__).absolute())]
@@ -324,7 +320,7 @@ def setup(args):
         + "\nend open location\n"
     )
     # Build and sign before replacing an existing installation.
-    with tempfile.TemporaryDirectory(prefix=".sioyek-arxiv-", dir=app.parent) as temporary:
+    with tempfile.TemporaryDirectory(prefix=".sioyek-open-", dir=app.parent) as temporary:
         staging = Path(temporary)
         source = staging / "handler.applescript"
         source.write_text(script, encoding="utf-8")
@@ -336,22 +332,19 @@ def setup(args):
         info = {key: value for key, value in info.items()
                 if not (key.startswith("NS") and key.endswith("UsageDescription"))}
         info.update(
-            CFBundleIdentifier="local.sioyek.arxiv",
+            CFBundleIdentifier="local.sioyek.open",
             CFBundleName="Open in Sioyek",
             CFBundleShortVersionString=VERSION,
             LSUIElement=True,
             CFBundleURLTypes=[dict(CFBundleURLName="Open in Sioyek",
-                                  CFBundleURLSchemes=["sioyek-open", "sioyek-arxiv"],
+                                  CFBundleURLSchemes=["sioyek-open"],
                                   CFBundleTypeRole="Viewer")],
         )
         plist.write_bytes(plistlib.dumps(info))
         subprocess.run(["/usr/bin/codesign", "--force", "--sign", "-", str(built)], check=True)
         previous = staging / "previous.app"
-        previous_path = app
-        if not app.exists() and owns_handler(legacy_handler_app()):
-            previous_path = legacy_handler_app()
-        if previous_path.exists():
-            previous_path.rename(previous)
+        if app.exists():
+            app.rename(previous)
         try:
             built.rename(app)
             subprocess.run([
@@ -362,11 +355,8 @@ def setup(args):
             if app.exists():
                 shutil.rmtree(app)
             if previous.exists():
-                previous.rename(previous_path)
+                previous.rename(app)
             raise
-        # If both generations were installed, remove only our legacy app.
-        if owns_handler(legacy_handler_app()):
-            shutil.rmtree(legacy_handler_app())
     config.update(papers_dir=str(directory), sioyek_app=str(sioyek))
     config_path().parent.mkdir(parents=True, exist_ok=True)
     config_path().write_text(json.dumps(config, indent=2) + "\n", encoding="utf-8")
@@ -382,15 +372,15 @@ def setup(args):
 
 
 def uninstall():
-    for app in (handler_app(), legacy_handler_app()):
-        if app.exists():
-            if not owns_handler(app):
-                raise ValueError(f"Refusing to remove an unrelated application: {app}")
-            subprocess.run([
-                "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister",
-                "-u", str(app),
-            ], check=True)
-            shutil.rmtree(app)
+    app = handler_app()
+    if app.exists():
+        if not owns_handler(app):
+            raise ValueError(f"Refusing to remove an unrelated application: {app}")
+        subprocess.run([
+            "/System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister",
+            "-u", str(app),
+        ], check=True)
+        shutil.rmtree(app)
     if support_dir().exists():
         shutil.rmtree(support_dir())
     print("Removed the per-user URL handler and bookmarklet setup files.")
@@ -428,7 +418,7 @@ def main():
             uninstall()
         elif args.command == "status":
             config = load_config()
-            print(f"Version: {VERSION}\nURL handler installed: {handler_app().is_dir() or owns_handler(legacy_handler_app())}")
+            print(f"Version: {VERSION}\nURL handler installed: {owns_handler(handler_app())}")
             print(f"Papers: {config.get('papers_dir', '~/Downloads/Papers')}")
             print(f"Sioyek: {config.get('sioyek_app', 'auto-detect')}\nConfig: {config_path()}")
         elif args.command == "open":

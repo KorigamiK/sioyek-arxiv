@@ -8,7 +8,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-import sioyek_arxiv as app
+import sioyek_open as app
 
 
 ABSTRACT = '''<meta name="citation_title" content="A &amp; B: A Paper">
@@ -18,7 +18,7 @@ ABSTRACT = '''<meta name="citation_title" content="A &amp; B: A Paper">
 
 class WorkflowTests(unittest.TestCase):
     def setUp(self):
-        self.temp = tempfile.TemporaryDirectory(prefix="sioyek-arxiv-test-")
+        self.temp = tempfile.TemporaryDirectory(prefix="sioyek-open-test-")
         self.addCleanup(self.temp.cleanup)
         self.home = Path(self.temp.name)
         self.environment = patch.dict(os.environ, {"HOME": str(self.home)})
@@ -36,7 +36,6 @@ class WorkflowTests(unittest.TestCase):
             ("https://arxiv.org/abs/1706.03762", "1706.03762"),
             ("https://arxiv.org/html/1706.03762v7", "1706.03762v7"),
             ("https://arxiv.org/pdf/hep-th/9901001v2.pdf#page=3", "hep-th/9901001v2"),
-            ("sioyek-arxiv://open?url=https%3A%2F%2Farxiv.org%2Fabs%2F1706.03762", "1706.03762"),
             ("sioyek-open://open?url=https%3A%2F%2Farxiv.org%2Fabs%2F1706.03762", "1706.03762"),
         ]:
             with self.subTest(url=url):
@@ -48,7 +47,7 @@ class WorkflowTests(unittest.TestCase):
                     "https://arxiv.org:9000/abs/1706.03762",
                     "https://user@arxiv.org/abs/1706.03762",
                     "https://arxiv.org/abs/../../file", "file:///tmp/file.pdf",
-                    "sioyek-arxiv://other?url=https://arxiv.org/abs/1706.03762"]:
+                    "sioyek-open://other?url=https://arxiv.org/abs/1706.03762"]:
             with self.subTest(url=url), self.assertRaises(ValueError):
                 app.paper_id(url)
 
@@ -111,7 +110,7 @@ class WorkflowTests(unittest.TestCase):
         values.update(kwargs)
         return argparse.Namespace(**values)
 
-    def test_setup_migrates_existing_settings_and_stable_launcher(self):
+    def test_setup_preserves_settings_and_stable_launcher(self):
         sioyek = self.home / "Applications/sioyek.app"
         sioyek.mkdir(parents=True)
         papers = self.home / "My Papers"
@@ -130,7 +129,7 @@ class WorkflowTests(unittest.TestCase):
         self.assertIn("open --notify", script)
         self.assertNotIn("Cellar", script)
         info = plistlib.loads((app.handler_app() / "Contents/Info.plist").read_bytes())
-        self.assertEqual(info["CFBundleURLTypes"][0]["CFBundleURLSchemes"], ["sioyek-open", "sioyek-arxiv"])
+        self.assertEqual(info["CFBundleURLTypes"][0]["CFBundleURLSchemes"], ["sioyek-open"])
         self.assertNotIn("NSCameraUsageDescription", info)
         self.assertIn(str(papers), (app.support_dir() / "bookmarklet.html").read_text())
         self.assertEqual((app.support_dir() / "bookmarklet.txt").read_text().strip(), app.BOOKMARKLET)
@@ -138,7 +137,9 @@ class WorkflowTests(unittest.TestCase):
     def test_setup_failure_preserves_previous_app(self):
         sioyek = self.home / "sioyek.app"
         sioyek.mkdir()
-        app.handler_app().mkdir(parents=True)
+        (app.handler_app() / "Contents").mkdir(parents=True)
+        (app.handler_app() / "Contents/Info.plist").write_bytes(
+            plistlib.dumps({"CFBundleIdentifier": "local.sioyek.open"}))
         marker = app.handler_app() / "keep.txt"
         marker.write_text("original")
 
@@ -158,7 +159,7 @@ class WorkflowTests(unittest.TestCase):
         app.handler_app().mkdir(parents=True)
         (app.handler_app() / "Contents").mkdir()
         (app.handler_app() / "Contents/Info.plist").write_bytes(
-            plistlib.dumps({"CFBundleIdentifier": "local.sioyek.arxiv"}))
+            plistlib.dumps({"CFBundleIdentifier": "local.sioyek.open"}))
         app.support_dir().mkdir(parents=True)
         paper = self.home / "Downloads/Papers/keep.pdf"
         paper.parent.mkdir(parents=True)

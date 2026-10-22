@@ -57,7 +57,7 @@ sioyek-open bookmarklet --browser Firefox
 sioyek-open bookmarklet --print
 ```
 
-You can also edit `~/.config/sioyek/arxiv.json`:
+You can also edit `~/.config/sioyek-open/config.json`:
 
 ```json
 {
@@ -99,7 +99,7 @@ The downloader does not share Firefox's login session. For a PDF requiring
 browser cookies or sign-in, download it in Firefox first, then use its local
 `file://` URL.
 
-## Updates and existing installations
+## Updates
 
 ```sh
 brew update
@@ -110,25 +110,12 @@ The registered app launches the package through Homebrew's stable `opt` path,
 so formula upgrades do not embed obsolete Cellar or Python patch-version paths.
 Rerun `sioyek-open setup` to refresh the app and setup page when needed.
 
-**Upgrading from 0.1.0:** Homebrew migrates the old `sioyek-arxiv` formula to
-`sioyek-open`. Run `sioyek-open setup --browser Firefox`, then replace
-the old browser bookmark with the new button from the setup page. The old
-bookmark's JavaScript restricts it to arXiv; upgrading the program alone does
-not replace browser bookmarks.
-
-If you used the original helper in
-[KorigamiK/sioyek](https://github.com/KorigamiK/sioyek), install this formula and
-run `setup`. The original `sioyek-arxiv` command and `sioyek-arxiv://` URL scheme remain
-compatibility aliases. Existing settings and papers are preserved. Setup
-replaces the old app with `~/Applications/Open in Sioyek.app`. The settings and
-support files keep their original paths for compatibility.
-
 ## Files and removal
 
 - App: `~/Applications/Open in Sioyek.app`
-- Settings: `~/.config/sioyek/arxiv.json`
-- Setup page: `~/Library/Application Support/Sioyek arXiv/bookmarklet.html`
-- Errors and download log: `~/Library/Application Support/Sioyek arXiv/download.log`
+- Settings: `~/.config/sioyek-open/config.json`
+- Setup page: `~/Library/Application Support/Open in Sioyek/bookmarklet.html`
+- Errors and download log: `~/Library/Application Support/Open in Sioyek/download.log`
 
 To remove the per-user integration and package:
 
@@ -147,12 +134,11 @@ Requires Python 3.9 or newer; the Homebrew formula supplies Python automatically
 The URL handler and app setup require macOS. To run without Homebrew:
 
 ```sh
-python3 sioyek_arxiv.py setup --browser Firefox
+python3 sioyek_open.py setup --browser Firefox
 python3 -m unittest discover -s tests -v
 ```
 
 Keep the checkout and Python interpreter installed when using source setup. Use
 the Homebrew installation for upgrade-stable paths.
 
-Licensed under GPL-3.0-only. Initially developed as the arXiv helper scripts in
-the Sioyek fork linked above.
+Licensed under GPL-3.0-only.
