@@ -11,27 +11,50 @@ import plistlib
 import re
 import shlex
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import unicodedata
+from contextlib import closing
+from datetime import datetime, timezone
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 
-VERSION = "0.3.0"
-BOOKMARKLET = (
-    "javascript:(()=>{let u=new URL(location.href);"
-    "const arxiv=/^(www\\.|export\\.)?arxiv\\.org$/.test(u.hostname)"
-    "&&/^\\/(abs|html|pdf)\\//.test(u.pathname);"
-    "const pdf=/\\.pdf$/i.test(u.pathname)||document.contentType==='application/pdf';"
-    "if(!arxiv&&!pdf){const s=prompt('Paste an arXiv, PDF, or local file:// PDF URL:','');"
-    "if(!s)return;try{u=new URL(s.trim());}catch{alert('Please enter a complete URL.');return;}}"
-    "if(!['https:','http:','file:'].includes(u.protocol))"
-    "{alert('Use an http://, https://, or local file:// URL.');return;}"
-    "location.href='sioyek-open://open?url='+encodeURIComponent(u.href);})()"
-)
+VERSION = "0.4.0"
+BOOKMARKLET = "javascript:" + "".join(line.strip() for line in r"""
+(()=>{
+let u=new URL(location.href),same=true;
+const meta={};
+for(const e of [...document.querySelectorAll('meta[name],meta[property]')].slice(0,200)){
+const k=(e.getAttribute('name')||e.getAttribute('property')||'').toLowerCase();
+if(/^(citation_|dc[.:]|dcterms[.:]|prism[.:]|og:|twitter:)/.test(k)||['description','author','keywords'].includes(k)){
+const v=(e.getAttribute('content')||'').trim().slice(0,2000);
+if(v)(meta[k]??=[]).push(v);
+}}
+const arxiv=/^(www\.|export\.)?arxiv\.org$/.test(u.hostname)&&/^\/(abs|html|pdf)\//.test(u.pathname);
+const pdf=/\.pdf$/i.test(u.pathname)||document.contentType==='application/pdf';
+if(!arxiv&&!pdf){
+const candidate=meta.citation_pdf_url?.[0]||document.querySelector('link[type="application/pdf"]')?.href;
+if(candidate){try{u=new URL(candidate,location.href);}catch{alert('Invalid PDF link on this page.');return;}}
+else{const s=prompt('Paste an arXiv, PDF, or local file:// PDF URL:','');if(!s)return;
+try{u=new URL(s.trim());same=u.href===location.href;}catch{alert('Please enter a complete URL.');return;}}
+}
+if(!['https:','http:','file:'].includes(u.protocol)){alert('Use an http://, https://, or local file:// URL.');return;}
+const m=same?{page_url:location.href.slice(0,4000),page_title:document.title.slice(0,1000),
+canonical_url:(document.querySelector('link[rel="canonical"]')?.href||'').slice(0,4000),meta,json_ld:[]}:{};
+if(same){for(const e of [...document.querySelectorAll('script[type="application/ld+json"]')].slice(0,4)){
+if(e.textContent.length<=12000){try{m.json_ld.push(JSON.parse(e.textContent));}catch{}}
+}}
+let encoded=encodeURIComponent(JSON.stringify(m));
+while(encoded.length>24000&&m.json_ld?.length){m.json_ld.pop();encoded=encodeURIComponent(JSON.stringify(m));}
+while(encoded.length>24000&&Object.keys(m.meta||{}).length){delete m.meta[Object.keys(m.meta).pop()];encoded=encodeURIComponent(JSON.stringify(m));}
+if(encoded.length>24000)encoded=encodeURIComponent('{}');
+location.href='sioyek-open://open?url='+encodeURIComponent(u.href)+'&metadata='+encoded;
+})()
+""".splitlines())
 ARXIV_ID = r"(?:\d{4}\.\d{4,5}|[a-zA-Z][a-zA-Z.-]*/\d{7})(?:v[1-9]\d*)?"
 
 
@@ -94,6 +117,131 @@ def unwrap_url(value):
     return value
 
 
+def bookmark_metadata(value):
+    url = urlsplit(value)
+    if url.scheme != "sioyek-open":
+        return {}
+    values = parse_qs(url.query).get("metadata", [])
+    if not values:
+        return {}
+    if len(values) != 1 or len(values[0]) > 24000:
+        raise ValueError("Bookmarklet metadata is too large or repeated. Please update your bookmarklet.")
+    try:
+        data = json.loads(values[0])
+    except (ValueError, RecursionError) as error:
+        raise ValueError("Bookmarklet metadata is not valid JSON.") from error
+    if not isinstance(data, dict):
+        raise ValueError("Bookmarklet metadata must be a JSON object.")
+    for key in ("page_url", "page_title", "canonical_url"):
+        if key in data and not isinstance(data[key], str):
+            raise ValueError(f"Invalid bookmarklet metadata: {key} must be text.")
+    tags = data.get("meta", {})
+    if not isinstance(tags, dict) or any(not isinstance(k, str) or not isinstance(v, list)
+                                       or any(not isinstance(item, str) for item in v)
+                                       for k, v in tags.items()):
+        raise ValueError("Invalid bookmarklet citation tags.")
+    if not isinstance(data.get("json_ld", []), list):
+        raise ValueError("Invalid bookmarklet structured metadata.")
+    return data
+
+
+def normalize_metadata(data):
+    """Keep citation fields useful for exports; retain the original data separately."""
+    tags = {key.lower(): values for key, values in data.get("meta", {}).items()}
+
+    def values(*keys):
+        for key in keys:
+            found = [" ".join(value.split()) for value in tags.get(key, []) if value.strip()]
+            if found:
+                return list(dict.fromkeys(found))
+        return []
+
+    fields = {}
+    aliases = {
+        "title": ("citation_title", "dc.title", "dc:title", "og:title", "twitter:title"),
+        "authors": ("citation_author", "dc.creator", "dc:creator", "dcterms.creator", "author"),
+        "date": ("citation_publication_date", "citation_date", "dc.date", "dc:date", "prism.publicationdate"),
+        "doi": ("citation_doi", "dc.identifier", "dc:identifier", "prism.doi"),
+        "journal": ("citation_journal_title", "prism.publicationname"),
+        "conference": ("citation_conference_title",),
+        "publisher": ("citation_publisher", "dc.publisher", "dc:publisher"),
+        "volume": ("citation_volume", "prism.volume"),
+        "issue": ("citation_issue", "prism.number"),
+        "first_page": ("citation_firstpage", "prism.startingpage"),
+        "last_page": ("citation_lastpage", "prism.endingpage"),
+        "abstract": ("citation_abstract", "dc.description", "dc:description", "description", "og:description"),
+        "keywords": ("citation_keywords", "dc.subject", "dc:subject", "keywords"),
+        "language": ("citation_language", "dc.language", "dc:language"),
+        "issn": ("citation_issn", "prism.issn"),
+        "isbn": ("citation_isbn", "prism.isbn"),
+        "pdf_url": ("citation_pdf_url",),
+    }
+    for field, keys in aliases.items():
+        found = values(*keys)
+        if found:
+            fields[field] = found if field in ("authors", "keywords") else found[0]
+    doi_candidates = [value for key in aliases["doi"] for value in tags.get(key, [])]
+
+    # JSON-LD often supplies fields missing from citation meta tags. Only use
+    # publication objects, rather than mistaking an Organization for the paper.
+    pending = list(data.get("json_ld", []))
+    for _ in range(100):
+        if not pending:
+            break
+        item = pending.pop(0)
+        if isinstance(item, list):
+            pending.extend(item)
+            continue
+        if not isinstance(item, dict):
+            continue
+        if isinstance(item.get("@graph"), list):
+            pending.extend(item["@graph"])
+        types = item.get("@type", [])
+        types = [types] if isinstance(types, str) else types
+        if not isinstance(types, list) or not any(t in ("ScholarlyArticle", "Article", "Book", "Report", "CreativeWork")
+                                                  for t in types if isinstance(t, str)):
+            continue
+        for field, keys in {"title": ("headline", "name"), "date": ("datePublished",),
+                            "abstract": ("abstract", "description"), "language": ("inLanguage",)}.items():
+            for key in keys:
+                if isinstance(item.get(key), str) and item[key].strip():
+                    fields.setdefault(field, item[key].strip())
+                    break
+        authors = item.get("author", [])
+        authors = authors if isinstance(authors, list) else [authors]
+        names = []
+        for author in authors:
+            if isinstance(author, dict):
+                author = author.get("name") or " ".join(str(author.get(k, "")) for k in ("givenName", "familyName"))
+            if isinstance(author, str) and author.strip():
+                names.append(author.strip())
+        if names:
+            fields.setdefault("authors", list(dict.fromkeys(names)))
+        identifiers = item.get("identifier", [])
+        identifiers = identifiers if isinstance(identifiers, list) else [identifiers]
+        for doi in identifiers:
+            if isinstance(doi, dict):
+                doi = doi.get("value")
+            if isinstance(doi, str):
+                doi_candidates.append(doi)
+        publisher = item.get("publisher")
+        if isinstance(publisher, dict):
+            publisher = publisher.get("name")
+        if isinstance(publisher, str) and publisher.strip():
+            fields.setdefault("publisher", publisher.strip())
+    fields.pop("doi", None)
+    for candidate in doi_candidates:
+        doi = re.sub(r"^(?:https?://(?:dx\.)?doi\.org/|doi:\s*)", "", candidate.strip(), flags=re.I)
+        if re.fullmatch(r"10\.\d{4,9}/\S+", doi):
+            fields["doi"] = doi
+            break
+    if "date" in fields:
+        year = re.search(r"\b(\d{4})\b", fields["date"])
+        if year:
+            fields["year"] = year[1]
+    return fields
+
+
 def document_url(value):
     value = unwrap_url(value)
     url = urlsplit(value)
@@ -108,6 +256,12 @@ def document_url(value):
             or url.username is not None or url.password is not None
             or url.port == 0):
         raise ValueError("Use an arXiv URL, an http(s) PDF URL, or a local file:// PDF URL.")
+    # MIREX publishes www links, but its HTTPS certificate covers music-ir.org.
+    # Canonicalize this known alias before both downloading and naming the PDF.
+    # Do not guess alternate hosts for arbitrary certificate failures.
+    if url.hostname == "www.music-ir.org":
+        authority = "music-ir.org" + (f":{url.port}" if url.port is not None else "")
+        url = url._replace(netloc=authority)
     # Fragments such as #page=3 do not identify a different downloadable file.
     return url._replace(fragment="").geturl()
 
@@ -130,25 +284,40 @@ class Metadata(HTMLParser):
         super().__init__()
         self.title = ""
         self.links = []
+        self.tags = {}
 
     def handle_starttag(self, tag, attrs):
         attrs = dict(attrs)
         if tag == "meta" and attrs.get("name") == "citation_title":
             self.title = attrs.get("content", "")
+        if tag == "meta":
+            key = (attrs.get("name") or attrs.get("property") or "").lower()
+            content = attrs.get("content")
+            if key and content:
+                self.tags.setdefault(key, []).append(content)
         if tag == "a":
             self.links.append(attrs.get("href", ""))
 
 
 def fetch(url, destination):
-    subprocess.run([
-        "/usr/bin/curl", "--fail", "--location", "--silent", "--show-error",
-        "--proto", "=http,https", "--proto-redir", "=http,https", "--connect-timeout", "15",
-        "--max-time", "180", "--retry", "2", "--retry-delay", "2",
-        "--output", str(destination), url,
-    ], check=True)
+    try:
+        subprocess.run([
+            "/usr/bin/curl", "--fail", "--location", "--silent", "--show-error",
+            "--proto", "=http,https", "--proto-redir", "=http,https", "--connect-timeout", "15",
+            "--max-time", "180", "--retry", "2", "--retry-delay", "2",
+            "--output", str(destination), url,
+        ], check=True, capture_output=True, text=True)
+    except subprocess.CalledProcessError as error:
+        host = urlsplit(url).hostname
+        if error.returncode == 60:
+            message = f"HTTPS certificate verification failed for {host}. The download was stopped."
+        else:
+            message = f"Download failed for {host} (curl error {error.returncode})."
+        detail = (error.stderr or "").strip()
+        raise ValueError(message + (f"\n\n{detail}" if detail else "")) from error
 
 
-def describe(identifier):
+def describe(identifier, observations=None):
     with tempfile.TemporaryDirectory(prefix="sioyek-open-") as temp:
         page = Path(temp) / "abstract.html"
         fetch("https://arxiv.org/abs/" + identifier, page)
@@ -166,6 +335,12 @@ def describe(identifier):
         if not versions:
             raise ValueError("Could not identify the paper version on arXiv.")
         identifier += "v" + str(max(versions))
+    if observations is not None:
+        raw = {"meta": metadata.tags}
+        fields = normalize_metadata(raw)
+        fields["arxiv_id"] = identifier
+        observations.append(dict(kind="arxiv", url="https://arxiv.org/abs/" + identifier,
+                                 raw=raw, metadata=fields))
     return " ".join(metadata.title.split()), identifier
 
 
@@ -184,9 +359,9 @@ def is_pdf(path):
         return stream.read(5) == b"%PDF-"
 
 
-def save_paper(url, directory):
+def save_paper(url, directory, observations=None):
     identifier = paper_id(url)
-    title, identifier = describe(identifier)
+    title, identifier = describe(identifier, observations) if observations is not None else describe(identifier)
     return download_pdf("https://arxiv.org/pdf/" + identifier, directory, filename(title, identifier))
 
 
@@ -214,7 +389,7 @@ def download_pdf(url, directory, name):
     return destination
 
 
-def open_document(value, directory):
+def open_document(value, directory, observations=None):
     value = document_url(value)
     url = urlsplit(value)
     if url.scheme == "file":
@@ -225,13 +400,177 @@ def open_document(value, directory):
             raise ValueError(f"The local file is not a PDF: {path}")
         return path
     if url.hostname in ("arxiv.org", "www.arxiv.org", "export.arxiv.org"):
-        return save_paper(value, directory)
+        return save_paper(value, directory, observations)
     # Keep the URL's readable filename and distinguish documents with the same
     # basename. Include the query in the identity, but never expose it in names.
     title = unquote(url.path.rsplit("/", 1)[-1])
     title = re.sub(r"\.pdf$", "", title, flags=re.IGNORECASE) or "Document"
     identifier = hashlib.sha256(value.encode("utf-8")).hexdigest()[:12]
     return download_pdf(value, directory, filename(title, identifier))
+
+
+def library_path(directory):
+    return directory / "library.sqlite3"
+
+
+def library_database(directory):
+    directory.mkdir(parents=True, exist_ok=True)
+    database = sqlite3.connect(library_path(directory), timeout=15)
+    try:
+        database.execute("PRAGMA foreign_keys = ON")
+        version = database.execute("PRAGMA user_version").fetchone()[0]
+        if version not in (0, 1):
+            raise ValueError("This library requires a newer version of sioyek-open.")
+        database.executescript("""
+            CREATE TABLE IF NOT EXISTS documents (
+                id TEXT PRIMARY KEY, size_bytes INTEGER NOT NULL,
+                metadata TEXT NOT NULL, field_sources TEXT NOT NULL,
+                added_at TEXT NOT NULL, updated_at TEXT NOT NULL,
+                last_opened_at TEXT, open_count INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE TABLE IF NOT EXISTS files (
+                path TEXT PRIMARY KEY, document_id TEXT NOT NULL REFERENCES documents(id),
+                modified_at TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS observations (
+                document_id TEXT NOT NULL REFERENCES documents(id),
+                fingerprint TEXT NOT NULL, kind TEXT NOT NULL, url TEXT NOT NULL,
+                metadata TEXT NOT NULL, raw TEXT NOT NULL,
+                first_seen_at TEXT NOT NULL, last_seen_at TEXT NOT NULL,
+                PRIMARY KEY (document_id, fingerprint)
+            );
+            PRAGMA user_version = 1;
+        """)
+    except BaseException:
+        database.close()
+        raise
+    return database
+
+
+def file_metadata(path):
+    title = path.stem
+    fields = {}
+    match = re.search(r" \[(" + ARXIV_ID.replace("/", "_") + r")\]$", title)
+    if match:
+        fields["arxiv_id"] = match[1].replace("_", "/")
+        title = title[:match.start()]
+    else:
+        title = re.sub(r" \[[0-9a-f]{12}\]$", "", title)
+    fields["title"] = title or "Document"
+    return fields
+
+
+def record_document(path, directory, source_url=None, observations=()):
+    """Catalog a validated file atomically; identical bytes share one document."""
+    path = path.resolve()
+    if not is_pdf(path):
+        raise ValueError(f"Cannot catalog a non-PDF file: {path}")
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(chunk)
+    identifier = digest.hexdigest()
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    fallback = dict(kind="filename", url=path.as_uri(), raw={"filename": path.name}, metadata=file_metadata(path))
+    incoming = [fallback, *observations]
+    for observation in observations:
+        if observation["kind"] == "browser" and observation["raw"].get("page_title", "").strip():
+            title = observation["raw"]["page_title"].strip()
+            incoming.append(dict(kind="page", url=observation["url"], raw={"page_title": title},
+                                 metadata={"title": title}))
+    if source_url:
+        incoming.append(dict(kind="url", url=source_url, metadata={}, raw={}))
+    priorities = {"filename": 0, "url": 0, "page": 1, "browser": 2, "arxiv": 3}
+    with closing(library_database(directory)) as database, database:
+        # Lock before reading so simultaneous saves merge the latest metadata.
+        database.execute("BEGIN IMMEDIATE")
+        row = database.execute("SELECT metadata, field_sources FROM documents WHERE id = ?", (identifier,)).fetchone()
+        fields, origins = (json.loads(row[0]), json.loads(row[1])) if row else ({}, {})
+        for observation in incoming:
+            kind = observation["kind"]
+            for key, value in observation["metadata"].items():
+                previous = priorities.get(origins.get(key, {}).get("kind", "filename"), 0)
+                if value and (key not in fields or priorities[kind] > previous
+                              or (kind != "filename" and priorities[kind] == previous)):
+                    fields[key] = value
+                    origins[key] = {"kind": kind, "url": observation["url"]}
+        database.execute("""
+            INSERT INTO documents(id, size_bytes, metadata, field_sources, added_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(id) DO UPDATE SET metadata=excluded.metadata,
+                field_sources=excluded.field_sources, updated_at=excluded.updated_at
+        """, (identifier, path.stat().st_size, json.dumps(fields, ensure_ascii=False),
+              json.dumps(origins, ensure_ascii=False), now, now))
+        modified = datetime.fromtimestamp(path.stat().st_mtime, timezone.utc).isoformat()
+        database.execute("""
+            INSERT INTO files(path, document_id, modified_at) VALUES (?, ?, ?)
+            ON CONFLICT(path) DO UPDATE SET document_id=excluded.document_id, modified_at=excluded.modified_at
+        """, (str(path), identifier, modified))
+        for observation in incoming:
+            encoded = json.dumps(observation, sort_keys=True, ensure_ascii=False)
+            fingerprint = hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+            database.execute("""
+                INSERT INTO observations VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(document_id, fingerprint) DO UPDATE SET last_seen_at=excluded.last_seen_at
+            """, (identifier, fingerprint, observation["kind"], observation["url"],
+                  json.dumps(observation["metadata"], ensure_ascii=False),
+                  json.dumps(observation["raw"], ensure_ascii=False), now, now))
+    return identifier
+
+
+def library_records(directory):
+    if not library_path(directory).exists():
+        return []
+    with closing(library_database(directory)) as database, database:
+        database.execute("BEGIN")
+        records = []
+        for row in database.execute("SELECT * FROM documents ORDER BY added_at, id"):
+            identifier, size, metadata, origins, added, updated, opened, count = row
+            files = [dict(path=path, modified_at=modified, exists=Path(path).is_file())
+                     for path, modified in database.execute(
+                         "SELECT path, modified_at FROM files WHERE document_id = ? ORDER BY path", (identifier,))]
+            observations = [dict(kind=kind, url=url, metadata=json.loads(fields), raw=json.loads(raw),
+                                 first_seen_at=first, last_seen_at=last)
+                            for kind, url, fields, raw, first, last in database.execute(
+                                "SELECT kind, url, metadata, raw, first_seen_at, last_seen_at FROM observations "
+                                "WHERE document_id = ? ORDER BY first_seen_at, fingerprint", (identifier,))]
+            records.append(dict(id=identifier, sha256=identifier, size_bytes=size, metadata=json.loads(metadata),
+                                field_sources=json.loads(origins), added_at=added, updated_at=updated,
+                                last_opened_at=opened, open_count=count, files=files, observations=observations))
+    return records
+
+
+def mark_opened(directory, identifier):
+    now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    with closing(library_database(directory)) as database, database:
+        database.execute("UPDATE documents SET last_opened_at = ?, open_count = open_count + 1 WHERE id = ?",
+                         (now, identifier))
+
+
+def library_command(args, directory):
+    if args.library_command == "scan":
+        count = 0
+        for path in sorted(directory.rglob("*")):
+            if path.suffix.lower() == ".pdf" and path.is_file():
+                if not is_pdf(path):
+                    print(f"Skipped non-PDF: {path}", file=sys.stderr)
+                    continue
+                record_document(path, directory)
+                count += 1
+        print(f"Indexed {count} PDF files. Library: {library_path(directory)}")
+        return
+    records = library_records(directory)
+    if args.library_command == "export":
+        print(json.dumps(dict(schema_version=1, documents=records), ensure_ascii=False, indent=2))
+    elif args.library_command == "show":
+        matches = [record for record in records if record["id"].startswith(args.id)]
+        if len(matches) != 1:
+            raise ValueError("Use a unique document ID or prefix from library list.")
+        print(json.dumps(matches[0], ensure_ascii=False, indent=2))
+    else:
+        for record in records:
+            fields = record["metadata"]
+            print(f"{record['id'][:12]}\t{fields.get('year', '')}\t{fields.get('title', 'Document')}")
 
 
 def notify_error(message):
@@ -276,6 +615,10 @@ def bookmarklet_page(directory):
         'Web PDFs are saved in <code>' + html.escape(str(directory)) + '</code>. '
         'arXiv papers keep their title-and-version names; other PDFs use their '
         'URL filename and a short identifier. Local PDFs open in place.</p>'
+        '<p>The local library records each PDF and any citation metadata exposed '
+        'by the page. On article pages with a declared PDF link, the bookmark '
+        'downloads that PDF and keeps the article metadata. Replace an older '
+        'bookmark with this button to enable metadata capture.</p>'
         '<p>If the toolbar is hidden, press <b>⌘⇧B</b>. '
         'Alternatively, create a bookmark and paste this into its URL field:</p>'
         '<textarea readonly aria-label="Bookmarklet URL">'
@@ -404,6 +747,13 @@ def main():
     bookmark.add_argument("--browser", help="Browser to use, e.g. Firefox")
     bookmark.add_argument("--print", action="store_true", dest="print_url", help="Print the bookmarklet URL")
     commands.add_parser("status", help="Show your current setup")
+    library = commands.add_parser("library", help="Inspect, import, or export your local PDF catalog")
+    catalog = library.add_subparsers(dest="library_command", required=True)
+    catalog.add_parser("list", help="List document IDs and titles")
+    show = catalog.add_parser("show", help="Show a document's metadata and sources as JSON")
+    show.add_argument("id", help="Document SHA-256 or a unique prefix from library list")
+    catalog.add_parser("scan", help="Index existing PDFs in the papers folder without moving them")
+    catalog.add_parser("export", help="Write the complete library as JSON to stdout")
     commands.add_parser("uninstall", help="Remove your URL handler, keeping saved PDFs and settings")
     args = parser.parse_args()
     try:
@@ -421,16 +771,33 @@ def main():
             print(f"Version: {VERSION}\nURL handler installed: {owns_handler(handler_app())}")
             print(f"Papers: {config.get('papers_dir', '~/Downloads/Papers')}")
             print(f"Sioyek: {config.get('sioyek_app', 'auto-detect')}\nConfig: {config_path()}")
+            directory = Path(config.get("papers_dir", "~/Downloads/Papers")).expanduser()
+            print(f"Library: {library_path(directory)}")
+        elif args.command == "library":
+            config = load_config()
+            directory = Path(config.get("papers_dir", "~/Downloads/Papers")).expanduser()
+            library_command(args, directory)
         elif args.command == "open":
-            document_url(args.url)
+            source_url = document_url(args.url)
+            browser = bookmark_metadata(args.url)
             config = load_config()
             directory = Path(config.get("papers_dir", "~/Downloads/Papers")).expanduser()
             app = find_sioyek(config) if not args.no_open else None
-            destination = open_document(args.url, directory)
+            observations = [dict(kind="url", url=unwrap_url(args.url), metadata={}, raw={})]
+            if browser:
+                observations.append(dict(kind="browser", url=browser.get("page_url") or source_url,
+                                         raw=browser, metadata=normalize_metadata(browser)))
+            destination = open_document(args.url, directory, observations)
+            try:
+                identifier = record_document(destination, directory, source_url, observations)
+            except (sqlite3.Error, OSError) as error:
+                raise ValueError(f"PDF saved at {destination}, but the library at {library_path(directory)} "
+                                 f"could not be updated: {error}") from error
             print(destination, flush=True)
             if app:
                 subprocess.run(["/usr/bin/open", "-a", str(app), str(destination)], check=True)
-    except (ValueError, OSError, subprocess.CalledProcessError) as error:
+                mark_opened(directory, identifier)
+    except (ValueError, OSError, sqlite3.Error, subprocess.CalledProcessError) as error:
         message = str(error)
         print(message, file=sys.stderr, flush=True)
         if getattr(args, "notify", False):

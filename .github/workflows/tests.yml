@@ -20,6 +20,8 @@ jobs:
         with:
           python-version: ${{ matrix.python }}
       - run: python -m unittest discover -s tests -v
+      - uses: oven-sh/setup-bun@v2
+      - run: bun test tests/bookmarklet.test.js
       - name: Exercise the native macOS app lifecycle
         if: runner.os == 'macOS'
         env:
